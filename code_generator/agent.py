@@ -1,37 +1,64 @@
-                       
-import google.generativeai as genai
-from typing import Optional, Dict, Any
-import logging
-import asyncio                        
-from google.api_core.exceptions import InternalServerError, GoogleAPIError, DeadlineExceeded                              
-import time
-import re                             
+# code_generator/agent.py
+import httpx # For making asynchronous HTTP requests
+import json # For handling JSON data
+from typing import Optional, Dict, Any # For type hinting
+import logging # For logging messages
+import asyncio # For asynchronous operations
+import time # For time-related functions (though not directly used in this version's core logic)
+import re # For regular expressions (used in diff application)
 
+# Import interfaces and settings from the project's core and config modules
 from core.interfaces import CodeGeneratorInterface, BaseAgent, Program
 from config import settings
 
+# Get a logger instance for this module
 logger = logging.getLogger(__name__)
 
 class CodeGeneratorAgent(CodeGeneratorInterface):
+    """
+    An agent responsible for generating code using a Large Language Model (LLM),
+    specifically adapted to interact with an LM Studio server.
+    It can generate full code snippets or diffs to modify existing code.
+    """
     def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """
+        Initializes the CodeGeneratorAgent.
+
+        Args:
+            config (Optional[Dict[str, Any]]): Configuration dictionary (not actively used in this version).
+        """
         super().__init__(config)
-        if not settings.GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY not found in settings. Please set it in your .env file or config.")
-        genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model_name = settings.GEMINI_PRO_MODEL_NAME                                            
-        self.generation_config = genai.types.GenerationConfig(
-            temperature=1.3, 
-            top_p=0.9,
-            top_k=40
-        )
-        logger.info(f"CodeGeneratorAgent initialized with model: {self.model_name}")
-                                                                                                              
+        # Configure for LM Studio API
+        self.api_base_url = settings.LMSTUDIO_API_BASE_URL
+        self.model_name = settings.LMSTUDIO_MODEL_NAME # This might be a placeholder if the model is pre-selected in LM Studio
+        # self.api_key = settings.LMSTUDIO_API_KEY # Uncomment if your LM Studio instance requires an API key
+
+        # Standard LLM parameters for generation
+        self.temperature = 1.0  # Controls randomness: higher values (e.g., 1.0) make output more random, lower values (e.g., 0.2) make it more deterministic.
+        self.top_p = 0.9        # Nucleus sampling: considers the smallest set of tokens whose cumulative probability exceeds top_p.
+        self.max_tokens = 2048  # Maximum number of tokens to generate in the response.
+
+        logger.info(f"CodeGeneratorAgent initialized for LM Studio at: {self.api_base_url}")
 
     async def generate_code(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = None, output_format: str = "code") -> str:
+        """
+        Generates code or a diff based on the provided prompt using the LM Studio API.
+
+        Args:
+            prompt (str): The prompt to send to the LLM.
+            model_name (Optional[str]): The specific model to use (overrides the default if provided).
+            temperature (Optional[float]): The temperature for generation (overrides the default if provided).
+            output_format (str): The desired output format ("code" for full code, "diff" for a diff).
+
+        Returns:
+            str: The generated code or diff string, or an empty string if generation fails.
+        """
         effective_model_name = model_name if model_name else self.model_name
-        logger.info(f"Attempting to generate code using model: {effective_model_name}, output_format: {output_format}")
+        effective_temperature = temperature if temperature is not None else self.temperature
         
-                                            
+        logger.info(f"Attempting to generate code using LM Studio model: {effective_model_name}, output_format: {output_format}, temperature: {effective_temperature}")
+
+        # Augment prompt with diff instructions if 'diff' format is requested
         if output_format == "diff":
             prompt += '''
 
@@ -44,11 +71,11 @@ I need you to provide your changes as a sequence of diff blocks in the following
 >>>>>>> REPLACE
 
 IMPORTANT DIFF GUIDELINES:
-1. The SEARCH block MUST be an EXACT copy of code from the original - match whitespace, indentation, and line breaks precisely
-2. Each SEARCH block should be large enough (3-5 lines minimum) to uniquely identify where the change should be made
-3. Include context around the specific line(s) you want to change
-4. Make multiple separate diff blocks if you need to change different parts of the code
-5. For each diff, the SEARCH and REPLACE blocks must be complete, valid code segments
+1. The SEARCH block MUST be an EXACT copy of code from the original - match whitespace, indentation, and line breaks precisely.
+2. Each SEARCH block should be large enough (3-5 lines minimum) to uniquely identify where the change should be made.
+3. Include context around the specific line(s) you want to change.
+4. Make multiple separate diff blocks if you need to change different parts of the code.
+5. For each diff, the SEARCH and REPLACE blocks must be complete, valid code segments.
 
 Example of a good diff:
 <<<<<<< SEARCH
@@ -69,227 +96,227 @@ def calculate_sum(numbers):
 
 Make sure your diff can be applied correctly!
 '''
-        
         logger.debug(f"Received prompt for code generation (format: {output_format}):\n--PROMPT START--\n{prompt}\n--PROMPT END--")
-        
-        current_generation_config = genai.types.GenerationConfig(
-            temperature=temperature if temperature is not None else self.generation_config.temperature,
-            top_p=self.generation_config.top_p,
-            top_k=self.generation_config.top_k
-        )
-        if temperature is not None:
-            logger.debug(f"Using temperature override: {temperature}")
-        
-        model_to_use = genai.GenerativeModel(
-            effective_model_name,
-            generation_config=current_generation_config
-        )
+
+        headers = {
+            "Content-Type": "application/json",
+            # "Authorization": f"Bearer {self.api_key}" # Uncomment if API key is needed
+        }
+
+        # Payload for the LM Studio API (OpenAI-compatible chat completions endpoint)
+        payload = {
+            "model": effective_model_name, # This might be overridden by the LM Studio server's loaded model
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": effective_temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            # "stream": False, # Ensure non-streaming response for simpler handling
+        }
 
         retries = settings.API_MAX_RETRIES
         delay = settings.API_RETRY_DELAY_SECONDS
         
-        for attempt in range(retries):
-            try:
-                logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {effective_model_name}.")
-                response = await model_to_use.generate_content_async(prompt)
-                
-                if not response.candidates:
-                    logger.warning("Gemini API returned no candidates.")
-                    if response.prompt_feedback and response.prompt_feedback.block_reason:
-                        logger.error(f"Prompt blocked. Reason: {response.prompt_feedback.block_reason}")
-                        logger.error(f"Prompt feedback details: {response.prompt_feedback.safety_ratings}")
-                        raise GoogleAPIError(f"Prompt blocked by API. Reason: {response.prompt_feedback.block_reason}")
-                    return ""
+        # Use EVALUATION_TIMEOUT_SECONDS as a general timeout for the HTTP client
+        # This might need to be adjusted if LLM responses are very slow.
+        async with httpx.AsyncClient(timeout=settings.EVALUATION_TIMEOUT_SECONDS) as client:
+            for attempt in range(retries):
+                try:
+                    logger.debug(f"API Call Attempt {attempt + 1} of {retries} to {self.api_base_url}/chat/completions.")
+                    response = await client.post(
+                        f"{self.api_base_url}/chat/completions", # Standard OpenAI-compatible endpoint
+                        headers=headers,
+                        json=payload
+                    )
+                    response.raise_for_status() # Raises an HTTPStatusError for bad responses (4xx or 5xx)
 
-                generated_text = response.candidates[0].content.parts[0].text
-                logger.debug(f"Raw response from Gemini API:\n--RESPONSE START--\n{generated_text}\n--RESPONSE END--")
+                    response_data = response.json()
+                    
+                    # Validate the structure of the response
+                    if not response_data.get("choices") or \
+                       not isinstance(response_data["choices"], list) or \
+                       not response_data["choices"][0].get("message") or \
+                       not isinstance(response_data["choices"][0]["message"], dict) or \
+                       response_data["choices"][0]["message"].get("content") is None:
+                        logger.warning(f"LM Studio API returned an unexpected or incomplete response structure: {response_data}")
+                        if response_data.get("error"):
+                            logger.error(f"LM Studio API Error in response: {response_data.get('error')}")
+                            # Potentially raise an exception or handle more gracefully
+                        return "" # Return empty if critical parts are missing
+
+                    generated_text = response_data["choices"][0]["message"]["content"]
+                    logger.debug(f"Raw response from LM Studio API:\n--RESPONSE START--\n{generated_text}\n--RESPONSE END--")
+                    
+                    if output_format == "code":
+                        cleaned_code = self._clean_llm_output(generated_text)
+                        logger.debug(f"Cleaned code:\n--CLEANED CODE START--\n{cleaned_code}\n--CLEANED CODE END--")
+                        return cleaned_code
+                    else: # output_format == "diff"
+                        logger.debug(f"Returning raw diff text:\n--DIFF TEXT START--\n{generated_text}\n--DIFF TEXT END--")
+                        return generated_text
+                        
+                except httpx.HTTPStatusError as e:
+                    logger.warning(f"LM Studio API HTTP error on attempt {attempt + 1}/{retries}: {e.response.status_code} - {e.response.text}. Retrying in {delay}s...")
+                except httpx.RequestError as e: 
+                    logger.warning(f"LM Studio API request error on attempt {attempt + 1}/{retries}: {type(e).__name__} - {e}. Retrying in {delay}s...")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to decode JSON response from LM Studio on attempt {attempt + 1}/{retries}: {e}. Response text: {response.text if 'response' in locals() else 'N/A'}")
+                except Exception as e: 
+                    logger.error(f"An unexpected error occurred during code generation with LM Studio on attempt {attempt + 1}/{retries}: {e}", exc_info=True)
+                    # For truly unexpected errors, we might not want to retry, or retry with caution.
                 
-                if output_format == "code":
-                    if "```python" in generated_text:
-                        pass
-                    cleaned_code = self._clean_llm_output(generated_text)
-                    logger.debug(f"Cleaned code:\n--CLEANED CODE START--\n{cleaned_code}\n--CLEANED CODE END--")
-                    return cleaned_code
-                else:                           
-                    logger.debug(f"Returning raw diff text:\n--DIFF TEXT START--\n{generated_text}\n--DIFF TEXT END--")
-                    return generated_text                        
-            except (InternalServerError, DeadlineExceeded, GoogleAPIError) as e:
-                logger.warning(f"Gemini API error on attempt {attempt + 1}: {type(e).__name__} - {e}. Retrying in {delay}s...")
                 if attempt < retries - 1:
                     await asyncio.sleep(delay)
-                    delay *= 2 
+                    delay *= 2 # Exponential backoff
                 else:
-                    logger.error(f"Gemini API call failed after {retries} retries for model {effective_model_name}.")
-                    raise
-            except Exception as e:
-                logger.error(f"An unexpected error occurred during code generation with {effective_model_name}: {e}", exc_info=True)
-                raise
-        
-        logger.error(f"Code generation failed for model {effective_model_name} after all retries.")
-        return ""
+                    logger.error(f"LM Studio API call failed after {retries} retries.")
+            
+            logger.error(f"Code generation failed for LM Studio model {effective_model_name} after all retries.")
+            return "" # Fallback if all retries fail
 
     def _clean_llm_output(self, raw_code: str) -> str:
         """
-        Cleans the raw output from the LLM, typically removing markdown code fences.
-        Example: ```python\ncode\n``` -> code
+        Cleans the raw output from the LLM, typically by removing markdown code fences
+        (e.g., ```python\ncode\n``` becomes `code`).
+
+        Args:
+            raw_code (str): The raw string output from the LLM.
+
+        Returns:
+            str: The cleaned code string.
         """
         logger.debug(f"Attempting to clean raw LLM output. Input length: {len(raw_code)}")
         code = raw_code.strip()
         
+        # Regex to find ```python ... ``` or ``` ... ```
+        match = re.search(r"```(?:python\n)?(.*?)```", code, re.DOTALL)
+        if match:
+            cleaned = match.group(1).strip()
+            logger.debug("Cleaned markdown fences using regex.")
+            return cleaned
+        
+        # Fallback for simple cases if regex fails or isn't comprehensive
         if code.startswith("```python") and code.endswith("```"):
             cleaned = code[len("```python"): -len("```")].strip()
-            logger.debug("Cleaned Python markdown fences.")
+            logger.debug("Cleaned Python markdown fences (simple string strip).")
             return cleaned
         elif code.startswith("```") and code.endswith("```"):
             cleaned = code[len("```"): -len("```")].strip()
-            logger.debug("Cleaned generic markdown fences.")
+            logger.debug("Cleaned generic markdown fences (simple string strip).")
             return cleaned
             
-        logger.debug("No markdown fences found or standard cleaning applied to the stripped code.")
+        logger.debug("No markdown fences found by common patterns, returning stripped raw code.")
         return code
 
     def _apply_diff(self, parent_code: str, diff_text: str) -> str:
         """
-        Applies a diff in the AlphaEvolve format to the parent code.
-        Diff format:
+        Applies a diff in the custom format to the parent code.
+        The diff format is:
         <<<<<<< SEARCH
         # Original code block
         =======
         # New code block
         >>>>>>> REPLACE
-        
-        Uses fuzzy matching to handle slight variations in whitespace and indentation.
+
+        Args:
+            parent_code (str): The original code to apply the diff to.
+            diff_text (str): The diff string from the LLM.
+
+        Returns:
+            str: The modified code after applying the diff, or the original code if no changes were applied.
         """
         logger.info("Attempting to apply diff.")
-        logger.debug(f"Parent code length: {len(parent_code)}")
-        logger.debug(f"Diff text:\n{diff_text}")
-
         modified_code = parent_code
+        # Regex to find all diff blocks
+        # Using re.DOTALL so that . matches newlines within the SEARCH and REPLACE blocks
         diff_pattern = re.compile(r"<<<<<<< SEARCH\s*?\n(.*?)\n=======\s*?\n(.*?)\n>>>>>>> REPLACE", re.DOTALL)
         
-                                                                                
-                                                             
-        replacements_made = []
-        
-        for match in diff_pattern.finditer(diff_text):
+        patches_applied = 0
+        last_match_end = 0
+        current_diff_text = diff_text # Work on a copy to analyze remaining diff text
+
+        while True:
+            match = diff_pattern.search(current_diff_text)
+            if not match:
+                break
+
             search_block = match.group(1)
             replace_block = match.group(2)
             
-                                                                        
-            search_block_normalized = search_block.replace('\r\n', '\n').replace('\r', '\n').strip()
-            
+            # Normalize line endings for the search_block to improve matching robustness against parent_code
+            # Parent code's line endings are preserved during replacement.
+            search_block_normalized_for_matching = search_block.replace('\r\n', '\n').replace('\r', '\n')
+
+            # Attempt to find and replace the search_block in the *current* state of modified_code
             try:
-                                       
-                if search_block_normalized in modified_code:
-                    logger.debug(f"Found exact match for SEARCH block")
-                    modified_code = modified_code.replace(search_block_normalized, replace_block, 1)
-                    logger.debug(f"Applied one diff block. SEARCH:\n{search_block_normalized}\nREPLACE:\n{replace_block}")
-                else:
-                                                                                 
-                    normalized_search = re.sub(r'\s+', ' ', search_block_normalized)
-                    normalized_code = re.sub(r'\s+', ' ', modified_code)
+                # Find the first occurrence of the normalized search block
+                # To do this robustly, we might need to normalize `modified_code` for searching too,
+                # or search line by line if direct string replacement is too brittle.
+                # For now, let's try a direct replacement of the normalized version.
+                
+                # Create a version of modified_code with normalized line endings for searching
+                modified_code_normalized_for_search = modified_code.replace('\r\n', '\n').replace('\r', '\n')
+                
+                start_index = modified_code_normalized_for_search.find(search_block_normalized_for_matching)
+
+                if start_index != -1:
+                    # Found the block. We need to map start_index and end_index back to the original `modified_code`
+                    # This is complex if `modified_code` had mixed EOLs.
+                    # A simpler, though less robust approach for this example, is to assume `replace` handles it.
+                    # A truly robust diff apply would use a proper diffing library or more careful segment reconstruction.
+
+                    # For this implementation, we'll replace the first occurrence in the original `modified_code`
+                    # This assumes the LLM provides SEARCH blocks that are unique enough or appear in order.
                     
-                    if normalized_search in normalized_code:
-                        logger.debug(f"Found match after whitespace normalization")
-                                                                        
-                        start_pos = normalized_code.find(normalized_search)
-                        
-                                                                          
-                        original_pos = 0
-                        norm_pos = 0
-                        
-                        while norm_pos < start_pos and original_pos < len(modified_code):
-                            if not modified_code[original_pos].isspace() or (
-                                original_pos > 0 and 
-                                modified_code[original_pos].isspace() and 
-                                not modified_code[original_pos-1].isspace()
-                            ):
-                                norm_pos += 1
-                            original_pos += 1
-                        
-                                               
-                        end_pos = original_pos
-                        remaining_chars = len(normalized_search)
-                        
-                        while remaining_chars > 0 and end_pos < len(modified_code):
-                            if not modified_code[end_pos].isspace() or (
-                                end_pos > 0 and 
-                                modified_code[end_pos].isspace() and 
-                                not modified_code[end_pos-1].isspace()
-                            ):
-                                remaining_chars -= 1
-                            end_pos += 1
-                        
-                                                                                        
-                        overlap = False
-                        for start, end in replacements_made:
-                            if (start <= original_pos <= end) or (start <= end_pos <= end):
-                                overlap = True
-                                break
-                        
-                        if not overlap:
-                                                               
-                            actual_segment = modified_code[original_pos:end_pos]
-                            logger.debug(f"Replacing segment:\n{actual_segment}\nWith:\n{replace_block}")
-                            
-                                                 
-                            modified_code = modified_code[:original_pos] + replace_block + modified_code[end_pos:]
-                            
-                                                     
-                            replacements_made.append((original_pos, original_pos + len(replace_block)))
-                        else:
-                            logger.warning(f"Diff application: Skipping overlapping replacement")
+                    # Try replacing the search block (with its original EOLs from diff)
+                    temp_code_orig_eol = modified_code.replace(search_block, replace_block, 1)
+                    if temp_code_orig_eol != modified_code:
+                        modified_code = temp_code_orig_eol
+                        patches_applied += 1
+                        logger.debug(f"Applied one diff block (using original EOL from diff). SEARCH:\n{search_block}\nREPLACE:\n{replace_block}")
                     else:
-                                                               
-                        search_lines = search_block_normalized.splitlines()
-                        parent_lines = modified_code.splitlines()
-                        
-                                                                      
-                        if len(search_lines) >= 3:
-                                                                  
-                            first_line = search_lines[0].strip()
-                            last_line = search_lines[-1].strip()
-                            
-                            for i, line in enumerate(parent_lines):
-                                if first_line in line.strip() and i + len(search_lines) <= len(parent_lines):
-                                                                     
-                                    if last_line in parent_lines[i + len(search_lines) - 1].strip():
-                                                                                       
-                                        matched_segment = '\n'.join(parent_lines[i:i + len(search_lines)])
-                                        
-                                                              
-                                        modified_code = '\n'.join(
-                                            parent_lines[:i] + 
-                                            replace_block.splitlines() + 
-                                            parent_lines[i + len(search_lines):]
-                                        )
-                                        logger.debug(f"Applied line-by-line match. SEARCH:\n{matched_segment}\nREPLACE:\n{replace_block}")
-                                        break
-                            else:
-                                logger.warning(f"Diff application: SEARCH block not found even with line-by-line search:\n{search_block_normalized}")
+                        # Try replacing the search block (normalized EOL) if original EOL version didn't change anything
+                        # This covers cases where parent_code EOLs might differ from diff's search_block EOLs
+                        temp_code_norm_eol = modified_code.replace(search_block_normalized_for_matching, replace_block, 1)
+                        if temp_code_norm_eol != modified_code:
+                            modified_code = temp_code_norm_eol
+                            patches_applied += 1
+                            logger.debug(f"Applied one diff block (using normalized EOL for search). SEARCH:\n{search_block_normalized_for_matching}\nREPLACE:\n{replace_block}")
                         else:
-                            logger.warning(f"Diff application: SEARCH block not found in current code state:\n{search_block_normalized}")
-            except re.error as e:
-                logger.error(f"Regex error during diff application: {e}")
-                continue
+                            logger.warning(f"Diff application: SEARCH block was found by normalized search, but direct replacement attempts failed to change code. SEARCH block:\n{search_block}")
+                else:
+                    logger.warning(f"Diff application: SEARCH block not found in current code state:\n{search_block_normalized_for_matching}")
+            
             except Exception as e:
-                logger.error(f"Error during diff application: {e}", exc_info=True)
-                continue
-        
-        if modified_code == parent_code and diff_text.strip():
-             logger.warning("Diff text was provided, but no changes were applied. Check SEARCH blocks/diff format.")
-        elif modified_code != parent_code:
-             logger.info("Diff successfully applied, code has been modified.")
-        else:
-             logger.info("No diff text provided or diff was empty, code unchanged.")
+                logger.error(f"Error during a specific diff block application: {e}", exc_info=True)
+                # Continue to the next diff block if one fails
+
+            # Move to the text after the current match to find subsequent diffs
+            current_diff_text = current_diff_text[match.end():]
+
+        if patches_applied > 0:
+             logger.info(f"Diff successfully applied, {patches_applied} changes made.")
+        elif "=======" in diff_text: # Check if it looked like a diff format was intended
+             logger.warning("Diff text was provided (contained '======='), but no changes were applied. Check SEARCH blocks, diff format, or LLM output.")
+        else: # No '=======' implies it probably wasn't a diff or was empty
+             logger.info("No valid diff content provided or diff was empty, code unchanged.")
              
         return modified_code
 
     async def execute(self, prompt: str, model_name: Optional[str] = None, temperature: Optional[float] = None, output_format: str = "code", parent_code_for_diff: Optional[str] = None) -> str:
         """
-        Generic execution method.
+        Main execution method for the agent.
         If output_format is 'diff', it generates a diff and applies it to parent_code_for_diff.
         Otherwise, it generates full code.
+
+        Args:
+            prompt (str): The prompt for the LLM.
+            model_name (Optional[str]): Specific model name to use.
+            temperature (Optional[float]): Specific temperature for generation.
+            output_format (str): "code" or "diff".
+            parent_code_for_diff (Optional[str]): The original code if output_format is "diff".
+
+        Returns:
+            str: The generated (and potentially modified) code, or raw diff if application fails.
         """
         logger.debug(f"CodeGeneratorAgent.execute called. Output format: {output_format}")
         
@@ -302,28 +329,34 @@ Make sure your diff can be applied correctly!
 
         if output_format == "diff":
             if not parent_code_for_diff:
-                logger.error("Output format is 'diff' but no parent_code_for_diff provided. Returning raw diff.")
+                logger.error("Output format is 'diff' but no parent_code_for_diff provided. Returning raw diff output.")
                 return generated_output 
             
-            if not generated_output.strip():
-                 logger.info("Generated diff is empty. Returning parent code.")
-                 return parent_code_for_diff
+            # Check if the generated output actually looks like a diff and is not empty
+            if not generated_output.strip() or "=======" not in generated_output:
+                 logger.info("Generated output for diff is empty or not in expected format. Returning parent code unchanged.")
+                 return parent_code_for_diff # Return original code if diff is invalid
 
             try:
                 logger.info("Applying generated diff to parent code.")
                 modified_code = self._apply_diff(parent_code_for_diff, generated_output)
                 return modified_code
             except Exception as e:
-                logger.error(f"Error applying diff: {e}. Returning raw diff text.", exc_info=True)
-                return generated_output
-        else:         
+                # If diff application itself throws an unexpected error, log it and return the raw diff.
+                logger.error(f"Error applying diff: {e}. Returning raw diff text as fallback.", exc_info=True)
+                return generated_output # Return the raw diff for inspection
+        else: # output_format == "code"
             return generated_output
 
-                                                 
+# Main block for testing (can be run with `python -m code_generator.agent`)
 if __name__ == '__main__':
-    import asyncio
-    logging.basicConfig(level=logging.DEBUG)
+    # Configure logging for standalone testing
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
     
+    # Test for the _apply_diff method
     async def test_diff_application():
         agent = CodeGeneratorAgent()
         parent = """Line 1
@@ -334,7 +367,8 @@ To be changed
 End of block
 Final line"""
 
-        diff = """Some preamble text from LLM...
+        # Test case 1: Standard diff
+        diff1 = """Some preamble text from LLM...
 <<<<<<< SEARCH
 Line 2 to be replaced
 =======
@@ -354,7 +388,7 @@ Block
 Is New
 >>>>>>> REPLACE
 Trailing text..."""
-        expected_output = """Line 1
+        expected_output1 = """Line 1
 Line 2 has been successfully replaced
 Line 3
 This
@@ -363,88 +397,128 @@ Block
 Is New
 Final line"""
         
-        print("--- Testing _apply_diff directly ---")
-        result = agent._apply_diff(parent, diff)
-        print("Result of diff application:")
-        print(result)
-        assert result.strip() == expected_output.strip(), f"Direct diff application failed.\nExpected:\n{expected_output}\nGot:\n{result}"
-        print("_apply_diff test passed.")
+        print("\n--- Testing _apply_diff directly (Test Case 1) ---")
+        result1 = agent._apply_diff(parent, diff1)
+        print("Result of diff application (Test Case 1):")
+        print(f"Expected:\n{expected_output1}\nGot:\n{result1}")
+        assert result1.strip() == expected_output1.strip(), "Direct diff application failed for Test Case 1."
+        print("_apply_diff Test Case 1 passed.")
 
-        print("\n--- Testing execute with output_format='diff' ---")
-        async def mock_generate_code(prompt, model_name, temperature, output_format):
-            return diff
+        # Test case 2: Diff with slightly different line endings in search block
+        diff2 = """<<<<<<< SEARCH
+Line 2 to be replaced\r
+=======
+Line 2 replaced (CR EOL in search)
+>>>>>>> REPLACE"""
+        expected_output2 = """Line 1
+Line 2 replaced (CR EOL in search)
+Line 3
+Another block
+To be changed
+End of block
+Final line"""
+        print("\n--- Testing _apply_diff directly (Test Case 2 - EOL Mismatch) ---")
+        result2 = agent._apply_diff(parent, diff2)
+        print(f"Expected:\n{expected_output2}\nGot:\n{result2}")
+        assert result2.strip() == expected_output2.strip(), "Direct diff application failed for Test Case 2."
+        print("_apply_diff Test Case 2 passed.")
+
+
+        print("\n--- Testing execute with output_format='diff' (mocked LLM) ---")
+        async def mock_generate_code_for_diff_test(prompt, model_name, temperature, output_format):
+            # This mock should return the 'diff1' string for this test
+            return diff1
         
-        agent.generate_code = mock_generate_code 
+        original_generate_code_method = agent.generate_code # Save original method
+        agent.generate_code = mock_generate_code_for_diff_test # Mock the method
         
         result_execute_diff = await agent.execute(
-            prompt="doesn't matter for this mock", 
+            prompt="mocked_prompt_for_diff", 
             parent_code_for_diff=parent,
             output_format="diff"
         )
-        print("Result of execute with diff:")
+        agent.generate_code = original_generate_code_method # Restore original method
+
+        print("Result of execute with diff (mocked LLM):")
         print(result_execute_diff)
-        assert result_execute_diff.strip() == expected_output.strip(), f"Execute with diff failed.\nExpected:\n{expected_output}\nGot:\n{result_execute_diff}"
-        print("Execute with diff test passed.")
+        assert result_execute_diff.strip() == expected_output1.strip(), "Execute with diff (mocked) failed."
+        print("Execute with diff (mocked LLM) test passed.")
 
-
-    async def test_generation():
-        agent = CodeGeneratorAgent()
+    # Test for LM Studio code generation (requires a running LM Studio server)
+    async def test_lm_studio_generation():
+        # This agent will use LMStudio settings from config/settings.py by default
+        agent = CodeGeneratorAgent() 
         
-        test_prompt_full_code = "Write a Python function that takes two numbers and returns their sum."
-        generated_full_code = await agent.execute(test_prompt_full_code, temperature=0.6, output_format="code")
-        print("\n--- Generated Full Code (via execute) ---")
-        print(generated_full_code)
-        print("----------------------")
-        assert "def" in generated_full_code, "Full code generation seems to have failed."
+        print("\n--- Testing Code Generation with LM Studio (LIVE TEST) ---")
+        # Simple prompt for full code generation
+        test_prompt_full_code = "Write a very simple Python function that takes two numbers, x and y, and returns their sum. Name the function 'add_two_numbers'."
+        
+        try:
+            # Test full code generation
+            generated_full_code = await agent.execute(test_prompt_full_code, temperature=0.5, output_format="code")
+            print("\n--- Generated Full Code (via LM Studio) ---")
+            print(generated_full_code)
+            print("-------------------------------------------")
+            assert "def add_two_numbers" in generated_full_code, "LM Studio full code generation failed to produce the expected function name."
+            print("LM Studio full code generation test passed (manual check of output recommended).")
 
-        parent_code_for_llm_diff = '''
-def greet(name):
+            # Test diff generation and application with LM Studio
+            parent_code_for_llm_diff = '''
+def greet(name: str) -> str:
+    """Greets the person."""
     return f"Hello, {name}!"
 
-def process_data(data):
-    # TODO: Implement data processing
-    return data * 2 # Simple placeholder
+def calculate_stuff(data: list) -> int:
+    # TODO: Implement actual calculation
+    result = sum(data) # Current simple sum
+    return result * 2 
 '''
-        test_prompt_diff_gen = f'''
-Current code:
+            test_prompt_diff_gen = f'''
+Current Python code:
 ```python
 {parent_code_for_llm_diff}
 ```
-Task: Modify the `process_data` function to add 5 to the result instead of multiplying by 2.
-Also, change the greeting in `greet` to "Hi, {name}!!!".
+Task:
+1. Modify the `greet` function to return "Greetings, {name}!!" instead.
+2. Modify the `calculate_stuff` function to subtract 5 from the sum before multiplying by 2.
+Provide the changes ONLY in the specified diff format.
 '''
-                                                                            
-                                                           
-                                          
-                              
-                                   
-                                                           
-           
-                                                                       
-                                           
-                                         
-                                                                                                               
-                                                                                                           
-        
-        async def mock_generate_empty_diff(prompt, model_name, temperature, output_format):
-            return "  \n  " 
-        
-        original_generate_code = agent.generate_code 
-        agent.generate_code = mock_generate_empty_diff
-        
-        print("\n--- Testing execute with empty diff from LLM ---")
-        result_empty_diff = await agent.execute(
-            prompt="doesn't matter",
-            parent_code_for_diff=parent_code_for_llm_diff,
-            output_format="diff"
-        )
-        assert result_empty_diff == parent_code_for_llm_diff, "Empty diff should return parent code."
-        print("Execute with empty diff test passed.")
-        agent.generate_code = original_generate_code
+            # This call will first generate a diff, then apply it
+            modified_code_via_diff = await agent.execute(
+                prompt=test_prompt_diff_gen,
+                output_format="diff",
+                parent_code_for_diff=parent_code_for_llm_diff,
+                temperature=0.7 # Slightly higher temp for potentially more creative diffs
+            )
+            print("\n--- Code After Applying Diff (from LM Studio) ---")
+            print(modified_code_via_diff)
+            print("-------------------------------------------------")
+            assert "Greetings, {name}!!" in modified_code_via_diff, "LM Studio diff for `greet` function was not applied correctly."
+            assert "sum(data) - 5" in modified_code_via_diff or "(sum(data) - 5)" in modified_code_via_diff, "LM Studio diff for `calculate_stuff` was not applied correctly."
+            assert modified_code_via_diff != parent_code_for_llm_diff, "LM Studio diff generation and application resulted in no change to the code."
+            print("LM Studio diff generation and application test passed (manual check of output recommended).")
 
-    async def main_tests():
-        await test_diff_application()
+        except httpx.RequestError as e:
+            print(f"LIVE LM Studio Test FAILED: Could not connect to LM Studio at {agent.api_base_url}. "
+                  f"Please ensure LM Studio is running with a model loaded and the server started. Error: {e}")
+        except Exception as e:
+            print(f"LIVE LM Studio Test FAILED with an unexpected error: {e}", exc_info=True)
+
+    # Main function to run the tests
+    async def main_tests_for_agent():
+        await test_diff_application() # Test the local _apply_diff logic
+        
+        # Control whether to run live tests against an LM Studio instance
+        run_live_lm_studio_tests = True # Set to False to skip live tests
+        
+        if run_live_lm_studio_tests:
+            print("\nIMPORTANT: The following tests will attempt to connect to a local LM Studio server.")
+            print(f"Please ensure LM Studio is running, a model is loaded, and the server is active at: {settings.LMSTUDIO_API_BASE_URL}.")
+            await test_lm_studio_generation()
+        else:
+            print("\nSkipping LIVE LM Studio generation tests as per `run_live_lm_studio_tests` flag.")
                                                                                      
-        print("\nAll selected local tests in CodeGeneratorAgent passed.")
+        print("\nAll selected tests for CodeGeneratorAgent completed.")
 
-    asyncio.run(main_tests())
+    # Run the asyncio event loop for the tests
+    asyncio.run(main_tests_for_agent())

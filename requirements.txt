@@ -1,15 +1,16 @@
 # Core Libraries
-google-generativeai>=0.3.0
+# google-generativeai>=0.3.0 # Commented out as we are switching to LM Studio for core generation
 python-dotenv>=1.0.0
+httpx[http2]>=0.25.0      # Added for making HTTP requests to LM Studio (http2 extra is optional but good for performance)
 
-# LLM Models & Frameworks
+# LLM Models & Frameworks (These are often for local model management, not direct API interaction)
 # transformers
 # torch
 # accelerate
 # bitsandbytes # For quantization if needed
 # sentencepiece
 
-# Evolutionary Algorithms / RL
+# Evolutionary Algorithms / RL (These are general libraries, not specific to the LLM choice)
 # deap
 # pygad
 # ray[rllib]
@@ -18,21 +19,31 @@ python-dotenv>=1.0.0
 # Evaluation & Sandboxing
 # pytest
 # hypothesis
-# e2b-sdk  # For E2B sandbox
-# docker
+# e2b-sdk  # For E2B sandbox (if you plan to use it)
+# docker   # If you plan to use Docker for sandboxing
 
-# Data Storage
+# Data Storage (Relevant if you use database backends other than in-memory)
 # psycopg2-binary  # For PostgreSQL
-# pymongo  # For MongoDB
-# dvc
+# pymongo          # For MongoDB
+# dvc              # For data version control
 
 # Utilities
-# jinja2
+# jinja2           # Useful for more complex prompt templating if needed
 
-# API/Web (Optional, if exposing functionality)
+# API/Web (Gradio is used for the UI)
 # fastapi
 # uvicorn
-
-asyncio>=3.4.3
-uuid>=1.30
 gradio>=4.0.0
+
+# Standard Python libraries used directly
+asyncio>=3.4.3
+uuid>=1.30 # Though uuid is part of Python's standard library, listing it if a specific version was intended. Usually not needed here.
+
+# Notes:
+# - Ensure your Python version is compatible with these libraries (e.g., Python 3.9+ is generally safe).
+# - If you were using `google-generativeai` for other purposes (e.g., a separate evaluation LLM call that's not being changed),
+#   you might need to keep it. However, the primary CodeGeneratorAgent is now using `httpx`.
+# - The `uuid` library is part of the Python standard library, so explicitly listing it here is often unnecessary
+#   unless a very specific version is required that differs from the standard distribution.
+#   For simplicity and standard practice, it can often be omitted from requirements.txt.
+#   I've kept it as it was in the original file you provided.
